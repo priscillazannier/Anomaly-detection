@@ -1,1 +1,404 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from statsmodels.tsa.arima.model import ARIMA
+from sklearn.metrics import (
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+    roc_auc_score,
+    roc_curve
+)
+from statsmodels.tsa.stattools import adfuller
+import warnings
+
+# Import auto_arima for automatic ARIMA parameter selection
+import pmdarima as pm
+
+# Suppress specific warnings to keep the output clean.
+warnings.filterwarnings("ignore", category=UserWarning, module='statsmodels')
+warnings.filterwarnings("ignore", category=RuntimeWarning, module='statsmodels')
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning, module='pmdarima')
+
+# ========================================================
+# STEP 1: Load Data from Excel
+# ========================================================
+
+try:
+    # Attempt to read the Excel file into a pandas DataFrame.
+    df = pd.read_excel("labelled dataset 2023 2024.xlsx")
+except FileNotFoundError:
+    print("Error: 'labelled dataset 2023 2024.xlsx' not found.")
+    print("Please ensure the Excel file is in the same directory as the script, or provide the full path.")
+    exit()
+
+# Create a copy of the relevant columns: 'Date', 'Settlement', and 'Label'.
+# .copy() is used to prevent SettingWithCopyWarning later when modifying this DataFrame.
+ts_data_original = df[['Date', 'Settlement', 'Label']].copy()
+# Convert the 'Date' column to datetime objects for proper time series handling.
+ts_data_original['Date'] = pd.to_datetime(ts_data_original['Date'])
+
+# Map the string labels 'normal' and 'anomaly' in the 'Label' column
+# to numerical values 0 and 1, respectively.
+ts_data_original['Label'] = ts_data_original['Label'].map({'normal': 0, 'anomaly': 1})
+
+# Create a new DataFrame specifically for ARIMA modeling.
+# Set 'Date' as the index. .copy() provides independence from ts_data_original.
+ts_data_arima = ts_data_original.set_index('Date').copy()
+# Ensure the index is a complete business day range.
+ts_data_arima.index = pd.date_range(start=ts_data_arima.index[0], periods=len(ts_data_arima), freq='B')
+
+# Extract the 'Settlement' values as the time series (`series`)
+# and the numerical 'Label' values as the ground truth (`labels`).
+series = ts_data_arima['Settlement']
+labels = ts_data_arima['Label']
+
+# ========================================================
+# STEP 1.0: Check for Stationarity
+# ========================================================
+print("\nChecking for Stationarity (Augmented Dickey-Fuller Test):")
+try:
+    # Perform the ADF test on the time series. .dropna() handles any missing values.
+    adf_test = adfuller(series.dropna())
+
+    # Print the ADF test results.
+    print(f"ADF Statistic: {adf_test[0]:.2f}") # More negative indicates stronger rejection of non-stationarity.
+    print(f"p-value: {adf_test[1]:.3f}")      # A low p-value suggests stationarity.
+    print("Critical Values:")
+    for key, value in adf_test[4].items(): # Critical values at different significance levels.
+        print(f"   {key}: {value:.2f}")
+
+    # Based on the p-value, determine if differencing might be needed.
+    if adf_test[1] <= 0.05:
+        print("Conclusion: The series is likely stationary (p-value <= 0.05).")
+        # If stationary, recommend 0 differencing (d=0) for auto_arima.
+        initial_d_recommendation = 0
+    else:
+        print("Conclusion: The series is likely non-stationary (p-value > 0.05). Differencing may be needed.")
+        # If non-stationary, recommend 1 differencing (d=1) for auto_arima.
+        initial_d_recommendation = 1
+
+except Exception as e:
+    # If the ADF test encounters an error, print it and proceed without a specific 'd' recommendation.
+    print(f"Error during stationarity test: {e}")
+    print("Cannot determine stationarity, proceeding with auto_arima to find 'd'.")
+    initial_d_recommendation = None # Let auto_arima determine 'd' automatically.
+
+# ========================================================
+# STEP 1.1: Automatic ARIMA Parameter Selection
+# ========================================================
+
+print("\nFinding optimal ARIMA parameters (p, d, q) using auto_arima...")
+try:
+    # Use auto_arima to find the best ARIMA (p, d, q) parameters.
+    # start_p, max_p, start_q, max_q define the search space for AR and MA orders.
+    # d is the order of differencing, recommended by the ADF test or determined automatically (max_d).
+    # trace=False suppresses detailed fitting output for each model tested.
+    # error_action='ignore' prevents errors from stopping the search for invalid models.
+    # suppress_warnings=True hides non-critical warnings from pmdarima.
+    # stepwise=True uses the 'stepwise' algorithm.
+    # seasonal=False indicates a non-seasonal ARIMA model.
+    # information_criterion='aic' uses Akaike Information Criterion to select the best model.
+    best_arima_model = pm.auto_arima(series,
+                                     start_p=1, max_p=7,
+                                     start_q=0, max_q=7,
+                                     d=initial_d_recommendation,
+                                     max_d=2,
+                                     trace=False,
+                                     error_action='ignore',
+                                     suppress_warnings=True,
+                                     stepwise=True,
+                                     seasonal=False,
+                                     information_criterion='aic')
+
+    # Get the best (p, d, q) order found by auto_arima.
+    best_order = best_arima_model.order
+    print(f"\nBest ARIMA order (p, d, q) found by auto_arima: {best_order}")
+
+except Exception as e:
+    # If auto_arima fails, print an error and fall back to a default ARIMA(0, 1, 0) order.
+    print(f"Error during auto_arima parameter selection: {e}")
+    print("Falling back to default ARIMA order (0, 1, 0) if auto_arima fails.")
+    best_order = (0, 1, 0) # Default: (AR=0, Differencing=1, MA=0)
+
+# Calculate the minimum number of data points required to fit an ARIMA model
+# here sum(p, d, q) + 1.
+min_window_for_arima = sum(best_order) + 1
+print(f"Minimum recommended window size for ARIMA order {best_order}: {min_window_for_arima}")
+
+# ========================================================
+# STEP 2: Outlier Detection Function
+# ========================================================
+
+def fbeta_score(y_true, y_pred, beta=2, zero_division=0):
+    """
+    Calculates the F-beta score.
+    Beta determines the weight of recall in the combined score.
+    `zero_division` handles cases where there are no positive predictions or actual positives.
+    """
+    precision = precision_score(y_true, y_pred, zero_division=zero_division)
+    recall = recall_score(y_true, y_pred, zero_division=zero_division)
+
+    if (precision == 0 and recall == 0):
+        return 0.0
+    return (1 + beta**2) * (precision * recall) / ((beta**2 * precision) + recall)
+
+def detect_outliers_by_arima_iqr(series, labels, window_sizes, threshold_multiplier=1.5, arima_order_found=None):
+    """
+    Detects outliers using an ARIMA model in a rolling window,
+    based on the Interquartile Range (IQR) of residuals.
+
+    Parameters:
+    series (pd.Series): time series data to analyze for anomalies.
+    labels (pd.Series): true labels (0 for normal, 1 for anomaly) for evaluation.
+    window_sizes (list): list of window sizes to test for the rolling ARIMA model.
+    threshold_multiplier (float): Multiplier for the IQR to set the anomaly threshold.
+                                  1.5 * IQR beyond Q3.
+    arima_order_found (tuple): The (p, d, q) order for the ARIMA model. If None,
+                                a default (0, 1, 0) will be used.
+
+    Returns:
+    pd.DataFrame: DataFrame containing performance metrics for each window size.
+    pd.Series: predicted labels (0/1) for the window size that achieved the best F2-score.
+    dict: A dictionary containing aligned true labels, predicted labels, and anomaly scores
+          for plotting ROC curves for each window size.
+    """
+    # initialization
+    results = []
+    best_window_preds = None
+    best_f2 = -1
+    aligned_data_for_plotting = {} # Stores data needed for ROC curve plotting (empty dictionary)
+
+    # Determine the ARIMA order to use.
+    if arima_order_found is None:
+        print("Warning: ARIMA order not provided to detection function. Using default (0, 1, 0).")
+        current_arima_order = (0, 1, 0)
+    else:
+        current_arima_order = arima_order_found
+
+    # Calculate the minimum data points needed for the chosen ARIMA order
+    min_data_points_for_arima = sum(current_arima_order) + 1 # rolling window must be at least this size to ensure the model can be successfully trained
+
+    # Iterate through each specified window size
+    for window in window_sizes:
+        predictions = [] # To store residuals and their timestamps for the current window
+        # Initialize predicted labels for the current window with all zeros
+        window_predicted_labels = pd.Series(index=series.index, data=0)
+
+        # Iterate through the time series, creating rolling windows for training
+        for i in range(len(series) - window):
+            train_data = series.iloc[i : i + window] # Data for training the ARIMA model
+            target_index = series.index[i + window]  # The index of the next data point to predict
+
+            # Skip if there's not enough data to fit the ARIMA model
+            if len(train_data.dropna()) < min_data_points_for_arima:
+                continue
+
+            try:
+                # Fit the ARIMA model to the training data
+                model = ARIMA(train_data, order=current_arima_order)    # trains the model on the train_data within the current window (from autoarima)
+                model_fit = model.fit()
+                # Forecast the next step
+                forecast = model_fit.forecast(steps=1)  # predicts the very next value in the series
+                pred_value = forecast.iloc[0]   # extracts the single predicted value from the forecast object
+                actual_value = series.loc[target_index] # retrieves the actual value from the original time series (series) at the timestamp (target_index) 
+                                                        # that the model just predicted
+                # Calculate the residual
+                residual = actual_value - pred_value
+                predictions.append({'timestamp': target_index, 'residual': residual})
+            except Exception as e:
+                # Catch and print any errors during ARIMA fitting for debugging purposes
+                # print(f"ARIMA fitting error at index {i + window}: {e}")
+                continue # Skip this window if fitting fails
+
+        # If no predictions were made for the current window size (e.g., due to errors or insufficient data)
+        if not predictions:
+            results.append({
+                'Window Size': window,
+                'Precision': 0, 'Recall': 0, 'F1-Score': 0, 'F2-Score': 0, 'AUC': 0,
+                'True Positives': 0, 'False Positives': 0, 'False Negatives': 0, 'True Negatives': 0
+            })
+            # Populate aligned data with empty series for consistency
+            aligned_data_for_plotting[window] = {
+                'y_true': pd.Series([], dtype=int),
+                'y_pred': pd.Series([], dtype=int),
+                'y_scores': pd.Series([], dtype=float)
+            }
+            continue
+
+        # Convert residuals to a DataFrame and calculate absolute residuals
+        residuals_df = pd.DataFrame(predictions).set_index('timestamp') # converts the list of dictionary (predictions) into DataFrame.
+        residuals = residuals_df['residual'].dropna()
+        abs_residuals = abs(residuals) # Use absolute residuals to detect deviations in either direction
+
+        # --- IQR Calculation for Anomaly Threshold ---
+        if len(abs_residuals) > 0:
+            Q1 = abs_residuals.quantile(0.25) # First quartile of absolute residuals
+            Q3 = abs_residuals.quantile(0.75) # Third quartile of absolute residuals
+            IQR = Q3 - Q1 # Interquartile Range
+
+            if IQR == 0: # Handle edge case where all residuals are the same
+                anomaly_threshold = np.finfo(float).eps # A very small number to prevent division by zero
+            else:
+                # Anomaly detection rule: an absolute residual is an outlier if it's above Q3 + (threshold_multiplier * IQR)
+                anomaly_threshold = Q3 + (threshold_multiplier * IQR)
+        else:
+            anomaly_threshold = 0.0001 # Default small threshold if no residuals were generated
+
+        # Classify points as anomalies (1) or normal (0) based on the threshold
+        residuals_df['predicted_label'] = (abs_residuals > anomaly_threshold).astype(int)
+
+        # Align true labels and predicted labels/scores based on timestamps where predictions were made
+        y_true_aligned = labels.loc[residuals_df.index].copy()  # retrieves the labels from the original dataset for the data points included in the rolling window analysis
+        y_pred_aligned = residuals_df['predicted_label'].copy() # retrieves the predicted labels for the data points included in the rolling window analysis
+        y_scores_aligned = abs(residuals_df['residual']).copy() # retrieves the anomaly scores
+
+        # Ensure all series have the same index for accurate metric calculation
+        common_index = y_true_aligned.index.intersection(y_pred_aligned.index).intersection(y_scores_aligned.index) # intersection() method 
+                                                                                    # is used to find the common elements between multiple sets
+                                                                                    # new index containing only the timestamps that are present in all three Series
+        y_true_aligned = y_true_aligned.loc[common_index]
+        y_pred_aligned = y_pred_aligned.loc[common_index]
+        y_scores_aligned = y_scores_aligned.loc[common_index]
+
+        # Update the overall predicted labels series for the current window
+        window_predicted_labels.loc[y_pred_aligned.index] = y_pred_aligned
+
+        # Calculate Confusion Matrix components
+        try:
+            cm = confusion_matrix(y_true_aligned, y_pred_aligned)
+            tn, fp, fn, tp = cm.ravel() # Method that flattens a multi-dimensional array into a 1-dimensional array
+        except ValueError: # Handles cases where confusion_matrix might fail (e.g., only one class present)
+            # Manually calculate TP, TN, FP, FN if confusion_matrix fails
+            tp = ((y_true_aligned == 1) & (y_pred_aligned == 1)).sum()
+            tn = ((y_true_aligned == 0) & (y_pred_aligned == 0)).sum()
+            fp = ((y_true_aligned == 0) & (y_pred_aligned == 1)).sum()
+            fn = ((y_true_aligned == 1) & (y_pred_aligned == 0)).sum()
+        except Exception: # General catch-all for other unexpected errors
+            tn, fp, fn, tp = 0, 0, 0, 0
+
+        # Calculate performance metrics
+        if y_true_aligned.sum() == 0 and y_pred_aligned.sum() == 0:
+            # Special case: no actual anomalies and no predicted anomalies (perfect scenario for this subset)
+            precision, recall, f1, f2, auc = 1.0, 1.0, 1.0, 1.0, 0.0 # AUC is not meaningful here
+        else:
+            precision = precision_score(y_true_aligned, y_pred_aligned, zero_division=0)
+            recall = recall_score(y_true_aligned, y_pred_aligned, zero_division=0)
+            f1 = f1_score(y_true_aligned, y_pred_aligned, zero_division=0)
+            f2 = fbeta_score(y_true_aligned, y_pred_aligned, beta=2, zero_division=0)
+            try:
+                # Calculate AUC if there's more than one unique class in true labels
+                if len(y_true_aligned.unique()) > 1:
+                    auc = roc_auc_score(y_true_aligned, y_scores_aligned)
+                else:
+                    auc = 0.0 # AUC is not well-defined if only one class is present
+            except ValueError: # Handles cases where roc_auc_score might fail (e.g., all same scores)
+                auc = 0.0
+
+        # Append results for the current window size
+        results.append({
+            'Window Size': window,
+            'Precision': precision,
+            'Recall': recall,
+            'F1-Score': f1,
+            'F2-Score': f2,
+            'AUC': auc,
+            'True Positives': tp,
+            'False Positives': fp,
+            'False Negatives': fn,
+            'True Negatives': tn
+        })
+
+        # Store aligned data for plotting ROC curves later
+        aligned_data_for_plotting[window] = {
+            'y_true': y_true_aligned,
+            'y_pred': y_pred_aligned,
+            'y_scores': y_scores_aligned
+        }
+
+        # Keep track of the best model based on F2-score
+        if f2 > best_f2:
+            best_f2 = f2
+            best_window_preds = window_predicted_labels.copy()
+
+    return pd.DataFrame(results), best_window_preds, aligned_data_for_plotting
+
+# ========================================================
+# STEP 3: Run Detection (Using best_order from auto_arima)
+# ========================================================
+
+# Define initial window sizes to test for the rolling ARIMA model.
+#initial_window_sizes_to_test = [5, 8, 9, 12, 13, 15, 20, 40]
+initial_window_sizes_to_test = list(range(8, 25))
+# Filter window sizes to ensure they meet the minimum data point requirement
+window_sizes = [w for w in initial_window_sizes_to_test if w >= min_window_for_arima]
+
+# adjust the list to ensure at least one valid window size is tested if no minimum requirement
+if not window_sizes:
+    print(f"Warning: None of the initial window sizes ({initial_window_sizes_to_test}) meet the minimum requirement ({min_window_for_arima}).")
+    print(f"Adding {min_window_for_arima} to the list of window sizes to ensure a run.")
+    window_sizes = [min_window_for_arima] # Add the minimum required size
+    # Optionally, add another slightly larger size to see a range
+    if min_window_for_arima + 5 not in window_sizes:
+        window_sizes.append(min_window_for_arima + 5)
+    window_sizes = sorted(list(set(window_sizes))) # Sort and remove duplicates
+
+print(f"\nRunning outlier detection with effective window sizes: {window_sizes}")
+
+# Execute the anomaly detection function using the time series, true labels,
+# the determined window sizes, and the optimal ARIMA order from auto_arima.
+# This function returns a DataFrame of results for each window, the predicted
+# labels for the best-performing model, and data for ROC curve plotting.
+results_df, best_model_predictions, aligned_plot_data = detect_outliers_by_arima_iqr(series, labels, window_sizes, arima_order_found=best_order)
+
+# ========================================================
+# STEP 4: Plot Metrics
+# ========================================================
+
+def plot_metrics(results_df):
+    """
+    Plots performance metrics against different window sizes with
+    correct annotations, font sizes, and legend placement.
+    """
+    if results_df.empty:
+        print("No results to plot metrics.")
+        return
+
+    # Define the metrics to be plotted.
+    metrics = ['Precision', 'Recall', 'F1-Score', 'F2-Score', 'AUC']
+
+    plt.figure(figsize=(14, 8))
+
+    # Iterate through each metric and plot its trend.
+    for metric in metrics:
+        sns.lineplot(data=results_df, x='Window Size', y=metric, marker='o', label=metric)
+
+    # Annotate only the F2-Score line (best model metric)
+    # for i, row in results_df.iterrows():
+    #     offset = 12 if i % 2 == 0 else -15  # alternate annotation positions
+        # plt.annotate(f"W={int(row['Window Size'])}",
+        #              (row['Window Size'], row['F2-Score']),
+        #              textcoords="offset points", xytext=(0, offset),
+        #              ha='center', fontsize=9, weight='bold',
+        #              arrowprops=dict(arrowstyle="->", color='gray', lw=0.5),
+        #              bbox=dict(boxstyle="round,pad=0.3",
+        #                       edgecolor='white',
+        #                       facecolor='white',
+        #                       alpha=0.6))
+
+    plt.title('ARIMA Outlier Detection - Performance Metrics by Window Size', fontsize=18)
+    plt.xlabel('Window Size', fontsize=14)
+    plt.ylabel('Score', fontsize=14)
+    plt.xticks(results_df['Window Size'])
+    plt.legend(title="Metric", loc='upper right', fontsize=10, title_fontsize=14)
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig('performance_metrics.png')
+    print("Plot saved as 'performance_metrics.png'.")
+
+plot_metrics(results_df)
+
 
