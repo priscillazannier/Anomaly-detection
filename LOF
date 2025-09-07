@@ -1,1 +1,259 @@
+# ====================================================================================================
+# 1. Import Necessary Libraries
+# ====================================================================================================
+# Core libraries
+import pandas as pd   # Data manipulation and analysis
+import numpy as np    # Numerical operations
+
+# Visualization
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Machine learning utilities
+from sklearn.neighbors import LocalOutlierFactor
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import (
+    roc_auc_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    fbeta_score,
+    confusion_matrix
+)
+
+from sklearn.metrics import roc_curve, roc_auc_score
+
+# ====================================================================================================
+# 2. Load and Prepare the Dataset
+# ====================================================================================================
+data_file_path = 'labelled dataset 2023 2024.xlsx'
+
+# Load dataset safely
+try:
+    df = pd.read_excel(data_file_path)
+except FileNotFoundError:
+    print(f"Error: File '{data_file_path}' not found. Please check the path.")
+    raise SystemExit
+
+# Basic preprocessing
+df['Date'] = pd.to_datetime(df['Date'])  # Convert to datetime for time-aware analysis
+df['Label'] = df['Label'].map({'normal': 0, 'anomaly': 1}).astype(int)  # Encode labels
+df = df.sort_values('Date').reset_index(drop=True)
+
+# Feature engineering: settlement difference to remove trend
+df['Settlement_diff'] = df['Settlement'].diff().fillna(0)
+
+# ====================================================================================================
+# 3. Define Hyperparameters
+# ====================================================================================================
+number_of_neighbors_options = [12, 15, 17]       # n_neighbors for LOF 15, 20
+expected_anomaly_percentages = [0.05, 0.10]      # Contamination (expected anomaly rate)
+time_window_sizes = range(18, 26)                 # Rolling window sizes
+number_of_cv_splits = 5                          # CV splits for TimeSeriesSplit
+
+# ====================================================================================================
+# 4. Set Up Time Series Cross-Validation
+# ====================================================================================================
+# Ensures chronological integrity (no lookahead bias)
+time_series_splitter = TimeSeriesSplit(n_splits=number_of_cv_splits)
+
+# ====================================================================================================
+# 5. Anomaly Detection Function (LOF with Rolling Windows)
+# ====================================================================================================
+def detect_anomalies_lof(data_frame, target_variable_name, window_size, num_neighbors, contamination_rate, mode="forecasting"):
+    """
+    Detect anomalies in time series using Local Outlier Factor (LOF) on rolling windows.
+    Parameters
+    ----------
+    data_frame : pd.DataFrame
+        Must contain ['Date', 'Settlement', 'Settlement_diff'].
+    target_variable_name : str
+        Column on which anomalies are detected (e.g., 'Settlement_diff').
+    window_size : int
+        Rolling window size.
+    num_neighbors : int
+        n_neighbors parameter for LOF.
+    contamination_rate : float
+        Expected anomaly rate (0 < contamination_rate < 1).
+    mode : str, optional
+        "forecasting": score last point of each window (causal).
+        "retrospective": score middle point (uses past + future).
+    Returns
+    -------
+    results_df : pd.DataFrame
+        ['Date', 'Original_Settlement', 'Differenced_Settlement', 'Anomaly_Score', 'Model_Label']
+    """
+    if mode not in ["forecasting", "retrospective"]:
+        raise ValueError("mode must be 'forecasting' or 'retrospective'")
+
+    scores_list = []
+    dates_list = []
+    settlement_values = []
+    settlement_diff_values = []
+
+    series_data = data_frame[target_variable_name].values
+    n = len(series_data)
+
+    for i in range(n - window_size + 1):
+        window_vals = series_data[i:i + window_size].reshape(-1, 1)
+
+        # Skip invalid configurations (n_neighbors >= window size)
+        if window_size <= num_neighbors:
+            continue
+
+        # Fit LOF on current window (contamination handled manually later)
+        lof = LocalOutlierFactor(n_neighbors=num_neighbors, contamination="auto")
+        lof.fit(window_vals)
+
+        # LOF negative_outlier_factor_: lower = more anomalous → flip sign
+        lof_scores = -lof.negative_outlier_factor_
+
+        # Decide which point in window to assign
+        j = window_size - 1 if mode == "forecasting" else window_size // 2
+
+        # Get anomaly score for this point
+        anomaly_score = lof_scores[j]
+
+        # Map back to global index
+        global_idx = i + j
+        date = data_frame['Date'].iloc[global_idx]
+        settlement_val = data_frame['Settlement'].iloc[global_idx]
+        settlement_diff_val = data_frame['Settlement_diff'].iloc[global_idx]
+
+        scores_list.append(anomaly_score)
+        dates_list.append(date)
+        settlement_values.append(settlement_val)
+        settlement_diff_values.append(settlement_diff_val)
+
+    if not scores_list:  # Edge case: no valid windows
+        return pd.DataFrame(columns=['Date', 'Original_Settlement', 'Differenced_Settlement', 'Anomaly_Score', 'Model_Label'])
+
+    # Convert to arrays for thresholding
+    scores = np.array(scores_list)
+
+    # Dynamic threshold: top X% anomalies based on contamination
+    threshold_score = np.percentile(scores, 100 * (1 - contamination_rate))
+    labels = (scores > threshold_score).astype(int)
+
+    # Build result DataFrame
+    results_df = pd.DataFrame({
+        'Date': dates_list,
+        'Original_Settlement': settlement_values,
+        'Differenced_Settlement': settlement_diff_values,
+        'Anomaly_Score': scores,
+        'Model_Label': labels
+    }).sort_values('Date').reset_index(drop=True)
+
+    return results_df
+
+# ====================================================================================================
+# 6. Evaluation Function
+# ====================================================================================================
+def evaluate_anomalies(model_results_df, actual_data_df):
+    """
+    Evaluate anomaly detection results vs. ground truth.
+
+    Returns
+    -------
+    metrics : dict
+        AUC, Precision, Recall, F1, F_beta_2, Confusion Matrix
+    merged : pd.DataFrame
+        Model results merged with ground truth labels.
+    """
+    if model_results_df is None or model_results_df.empty:
+        # Return default metrics if model produced no results
+        return {
+            'AUC': 0.0, 'Precision': 0.0, 'Recall': 0.0,
+            'F1': 0.0, 'F_beta_2': 0.0,
+            'Confusion_Matrix': np.zeros((2, 2), dtype=int)
+        }, pd.DataFrame()
+
+    # Merge with ground truth
+    merged = pd.merge(
+        model_results_df,
+        actual_data_df[['Date', 'Label']],
+        on='Date',
+        how='left'
+    )
+    merged['Label'] = merged['Label'].fillna(0).astype(int)
+
+    y_true = merged['Label'].values
+    y_pred = merged['Model_Label'].values
+    y_score = merged['Anomaly_Score'].values
+
+    # Metrics
+    try:
+        auc_val = roc_auc_score(y_true, y_score)
+    except ValueError:
+        auc_val = 0.0  # Undefined if only one class present
+
+    metrics = {
+        'AUC': auc_val,
+        'Precision': precision_score(y_true, y_pred, zero_division=0),
+        'Recall': recall_score(y_true, y_pred, zero_division=0),
+        'F1': f1_score(y_true, y_pred, zero_division=0),
+        'F_beta_2': fbeta_score(y_true, y_pred, beta=2, zero_division=0),
+        'Confusion_Matrix': confusion_matrix(y_true, y_pred, labels=[0, 1])
+    }
+
+    return metrics, merged
+
+# ====================================================================================================
+# 7. Cross-Validation for Hyperparameter Tuning
+# ====================================================================================================
+all_average_metrics = []                 # summary metrics across configs
+raw_results_per_config_fold = {}         # detailed fold-level results (for debugging)
+
+for current_window_size in time_window_sizes:
+    for current_num_neighbors in number_of_neighbors_options:
+        for current_contamination_rate in expected_anomaly_percentages:
+
+            if current_num_neighbors >= current_window_size:
+                continue  # invalid config
+
+            fold_metrics_list = []
+
+            for fold_index, (train_idx, test_idx) in enumerate(time_series_splitter.split(df)):
+                test_df = df.iloc[test_idx].reset_index(drop=True)
+
+                # Detect anomalies (unsupervised → no training)
+                detection = detect_anomalies_lof(
+                    test_df, 'Settlement_diff',
+                    current_window_size, current_num_neighbors,
+                    current_contamination_rate
+                )
+
+                # Evaluate vs. ground truth
+                fold_metrics, merged_fold = evaluate_anomalies(detection, test_df)
+                fold_metrics.update({
+                    'Window_Size': current_window_size,
+                    'Neighbors': current_num_neighbors,
+                    'Contamination': current_contamination_rate,
+                    'Fold': fold_index + 1
+                })
+                fold_metrics_list.append(fold_metrics)
+
+                # Store raw outputs for analysis
+                raw_results_per_config_fold[(current_window_size,
+                                             current_num_neighbors,
+                                             current_contamination_rate,
+                                             fold_index)] = (detection, merged_fold)
+
+            # Average across folds
+            avg_metrics = {
+                'Window_Size': current_window_size,
+                'Neighbors': current_num_neighbors,
+                'Contamination': current_contamination_rate,
+                'AUC': np.mean([m['AUC'] for m in fold_metrics_list]),
+                'Precision': np.mean([m['Precision'] for m in fold_metrics_list]),
+                'Recall': np.mean([m['Recall'] for m in fold_metrics_list]),
+                'F1': np.mean([m['F1'] for m in fold_metrics_list]),
+                'F_beta_2': np.mean([m['F_beta_2'] for m in fold_metrics_list]),
+                'Confusion_Matrix': np.sum([m['Confusion_Matrix'] for m in fold_metrics_list], axis=0)
+            }
+            all_average_metrics.append(avg_metrics)
+
+metrics_summary_df = pd.DataFrame(all_average_metrics)
+
+
 
