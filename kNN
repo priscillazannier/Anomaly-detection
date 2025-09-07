@@ -1,1 +1,196 @@
+# ====================================================================================================
+# 1. Import Necessary Libraries
+# ====================================================================================================
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.neighbors import NearestNeighbors
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import (
+    roc_auc_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    fbeta_score,
+    confusion_matrix
+)
+from sklearn.metrics import roc_curve, roc_auc_score
+from collections import defaultdict
+
+# ====================================================================================================
+# 2. Load and Prepare the Dataset
+# ====================================================================================================
+data_file_path = 'labelled dataset 2023 2024.xlsx'
+
+try:
+    df = pd.read_excel(data_file_path)
+except FileNotFoundError:
+    print(f"Error: File '{data_file_path}' not found. Please check the path.")
+    raise SystemExit
+
+df['Date'] = pd.to_datetime(df['Date'])
+df['Label'] = df['Label'].map({'normal': 0, 'anomaly': 1}).astype(int)
+df = df.sort_values('Date').reset_index(drop=True)
+df['Settlement_diff'] = df['Settlement'].diff().fillna(0)
+
+# ====================================================================================================
+# 3. Define Hyperparameters
+# ====================================================================================================
+number_of_neighbors_options = [3, 5, 7, 9]  # 3, 5, 7, 9
+expected_anomaly_percentages = [0.05, 0.10]
+time_window_sizes = range(8, 26)
+number_of_cv_splits = 5
+
+# ====================================================================================================
+# 4. Time Series Cross-Validation
+# ====================================================================================================
+time_series_splitter = TimeSeriesSplit(n_splits=number_of_cv_splits)
+
+# ====================================================================================================
+# 5. Anomaly Detection Function (Causal Only)
+# ====================================================================================================
+def detect_anomalies_knn(data_frame, target_variable_name, window_size, num_neighbors, contamination_rate):
+    """
+    Detect anomalies using kNN distances on rolling windows (causal mode only).
+    """
+    score_dict = defaultdict(list)
+    value_dict = {}
+
+    series_data = data_frame[target_variable_name].values
+    n = len(series_data)
+
+    for i in range(n - window_size + 1):
+        window_vals = series_data[i:i + window_size].reshape(-1, 1)
+
+        if window_size <= num_neighbors:
+            continue
+
+        knn = NearestNeighbors(n_neighbors=num_neighbors, algorithm='brute')   # algorithm='brute'
+        knn.fit(window_vals)
+
+        # Score the last point of the window (causal)
+        target_val = window_vals[-1].reshape(1, -1)
+        distances, _ = knn.kneighbors(target_val)
+        anomaly_score = distances[0, -1]
+
+        date = data_frame['Date'].iloc[i + window_size - 1]
+        value_dict[date] = (
+            data_frame['Settlement'].iloc[i + window_size - 1],
+            data_frame['Settlement_diff'].iloc[i + window_size - 1]
+        )
+        score_dict[date].append(anomaly_score)
+
+    if not score_dict:
+        return pd.DataFrame(columns=['Date', 'Original_Settlement', 'Differenced_Settlement', 'Anomaly_Score', 'Model_Label'])
+
+    aggregated_scores = {d: max(scores) for d, scores in score_dict.items()}
+    scores = np.array(list(aggregated_scores.values()))
+    threshold_score = np.percentile(scores, 100 * (1 - contamination_rate))
+    labels = {d: int(s > threshold_score) for d, s in aggregated_scores.items()}
+
+    results_df = pd.DataFrame({
+        'Date': list(aggregated_scores.keys()),
+        'Original_Settlement': [value_dict[d][0] for d in aggregated_scores.keys()],
+        'Differenced_Settlement': [value_dict[d][1] for d in aggregated_scores.keys()],
+        'Anomaly_Score': list(aggregated_scores.values()),
+        'Model_Label': [labels[d] for d in aggregated_scores.keys()]
+    }).sort_values('Date').reset_index(drop=True)
+
+    return results_df
+
+# ====================================================================================================
+# 6. Evaluation Function
+# ====================================================================================================
+def evaluate_anomalies(model_results_df, actual_data_df):
+    if model_results_df is None or model_results_df.empty:
+        return {
+            'AUC': 0.0, 'Precision': 0.0, 'Recall': 0.0,
+            'F1': 0.0, 'F_beta_2': 0.0,
+            'Confusion_Matrix': np.zeros((2, 2), dtype=int)
+        }, pd.DataFrame()
+
+    merged = pd.merge(
+        model_results_df,
+        actual_data_df[['Date', 'Label']],
+        on='Date',
+        how='left'
+    )
+    merged['Label'] = merged['Label'].fillna(0).astype(int)
+
+    y_true = merged['Label'].values
+    y_pred = merged['Model_Label'].values
+    y_score = merged['Anomaly_Score'].values
+
+    try:
+        auc_val = roc_auc_score(y_true, y_score)
+    except ValueError:
+        auc_val = 0.0
+
+    metrics = {
+        'AUC': auc_val,
+        'Precision': precision_score(y_true, y_pred, zero_division=0),
+        'Recall': recall_score(y_true, y_pred, zero_division=0),
+        'F1': f1_score(y_true, y_pred, zero_division=0),
+        'F_beta_2': fbeta_score(y_true, y_pred, beta=2, zero_division=0),
+        'Confusion_Matrix': confusion_matrix(y_true, y_pred, labels=[0, 1])
+    }
+
+    return metrics, merged
+
+# ====================================================================================================
+# 7. Cross-Validation (Causal Mode Only)
+# ====================================================================================================
+all_average_metrics = []
+raw_results_per_config_fold = {}
+
+for current_window_size in time_window_sizes:
+    for current_num_neighbors in number_of_neighbors_options:
+        for current_contamination_rate in expected_anomaly_percentages:
+
+            if current_num_neighbors >= current_window_size:
+                continue
+
+            fold_metrics_list = []
+
+            for fold_index, (train_idx, test_idx) in enumerate(time_series_splitter.split(df)):
+                test_df = df.iloc[test_idx].reset_index(drop=True)
+
+                detection = detect_anomalies_knn(
+                    test_df, 'Settlement_diff',
+                    current_window_size, current_num_neighbors,
+                    current_contamination_rate
+                )
+
+                fold_metrics, merged_fold = evaluate_anomalies(detection, test_df)
+                fold_metrics.update({
+                    'Window_Size': current_window_size,
+                    'Neighbors': current_num_neighbors,
+                    'Contamination': current_contamination_rate,
+                    'Fold': fold_index + 1
+                })
+                fold_metrics_list.append(fold_metrics)
+
+                raw_results_per_config_fold[(current_window_size,
+                                             current_num_neighbors,
+                                             current_contamination_rate,
+                                             fold_index)] = (detection, merged_fold)
+
+            avg_metrics = {
+                'Window_Size': current_window_size,
+                'Neighbors': current_num_neighbors,
+                'Contamination': current_contamination_rate,
+                'AUC': np.mean([m['AUC'] for m in fold_metrics_list]),
+                'Precision': np.mean([m['Precision'] for m in fold_metrics_list]),
+                'Recall': np.mean([m['Recall'] for m in fold_metrics_list]),
+                'F1': np.mean([m['F1'] for m in fold_metrics_list]),
+                'F_beta_2': np.mean([m['F_beta_2'] for m in fold_metrics_list]),
+                'Confusion_Matrix': np.sum([m['Confusion_Matrix'] for m in fold_metrics_list], axis=0)
+            }
+            all_average_metrics.append(avg_metrics)
+
+metrics_summary_df = pd.DataFrame(all_average_metrics)
+
+
 
