@@ -1,1 +1,366 @@
+# ============================================================================
+# CAUSAL ANOMALY DETECTION PIPELINE USING ONE-CLASS SVM WITH TIME WINDOWING
+# ============================================================================
+
+# Block 1: Import Libraries and Set Parameters
+# ============================================================================
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.svm import OneClassSVM
+from sklearn.metrics import (
+    roc_auc_score, precision_score, recall_score, f1_score, fbeta_score,
+    confusion_matrix, roc_curve, classification_report
+)
+from sklearn.model_selection import ParameterGrid
+import warnings
+warnings.filterwarnings('ignore')
+from collections import defaultdict
+
+# Set random seed for reproducibility
+np.random.seed(42)
+
+# Define parameter grid for hyperparameter tuning
+param_grid = {
+    'kernel': ['linear', 'rbf'],
+    'gamma': ['scale', 0.001, 0.01, 0.05],
+    'nu': [0.05, 0.10], 
+    'window_size': list(range(8, 26))
+}
+
+print("=== CAUSAL ANOMALY DETECTION PIPELINE INITIALIZED ===")
+print(f"Parameter grid contains {len(list(ParameterGrid(param_grid)))} combinations")
+
+# ============================================================================
+# Block 2: Data Loading and Preprocessing 
+# ============================================================================
+
+def load_and_preprocess_data(filename):
+    """
+    Load the Excel file and preprocess the data.
+    This function handles date parsing and creates the differentiated Settlement column.
+    """
+    print("\n=== LOADING AND PREPROCESSING DATA ===")
+    
+    # Load the data
+    data = pd.read_excel(filename)
+    print(f"Data loaded: {data.shape[0]} rows, {data.shape[1]} columns")
+    
+    # Convert Date column to datetime
+    data['Date'] = pd.to_datetime(data['Date'])
+    
+    # Sort by date to ensure proper order
+    data = data.sort_values('Date').reset_index(drop=True)
+    
+    # Create first-order difference of Settlement
+    data['Settlement_Diff'] = data['Settlement'].diff()
+    
+    # Remove the first row (NaN due to differencing)
+    data = data.dropna(subset=['Settlement_Diff']).reset_index(drop=True)
+    
+    print(f"After preprocessing: {data.shape[0]} rows")
+    print(f"Date range: {data['Date'].min()} to {data['Date'].max()}")
+    print(f"Settlement range: {data['Settlement'].min():.2f} to {data['Settlement'].max():.2f}")
+    print(f"Settlement_Diff range: {data['Settlement_Diff'].min():.4f} to {data['Settlement_Diff'].max():.4f}")
+    
+    # Check label distribution
+    if 'Label' in data.columns:
+        label_counts = data['Label'].value_counts()
+        print(f"Label distribution:\n{label_counts}")
+    
+    return data
+
+# Load the data
+data = load_and_preprocess_data('labelled dataset 2023 2024.xlsx')
+
+# ============================================================================
+# Block 3: Find Normal Subperiods for Training 
+# ============================================================================
+
+def find_longest_normal_subperiod(df):
+    """
+    Find all normal subperiods longer than 10 days for training the model.
+    This ensures the model is trained only on clean, anomaly-free data.
+    """
+    print("\n=== FINDING NORMAL SUBPERIODS FOR TRAINING ===")
+    
+    sequences = []
+    current_length = 0
+    current_start_idx = 0
+    prev_date = None
+    prev_idx = None
+    
+    for idx, row in df.iterrows():
+        is_normal = row['Label'] == 'normal'
+        current_date = row['Date']
+        is_consecutive = prev_date is None or (current_date - prev_date) <= pd.Timedelta(days=3)
+       
+        if is_normal:
+            if is_consecutive:
+                current_length += 1
+            else:
+                if current_length > 10:
+                    sequences.append(df.iloc[current_start_idx:prev_idx + 1])
+                current_length = 1
+                current_start_idx = idx
+        else:
+            if current_length > 10:
+                sequences.append(df.iloc[current_start_idx:prev_idx + 1])
+            current_length = 0
+            current_start_idx = idx + 1
+       
+        prev_date = current_date
+        prev_idx = idx
+   
+    if current_length > 10:
+        sequences.append(df.iloc[current_start_idx:prev_idx + 1])
+   
+    print(f"Found {len(sequences)} normal sequences (>10 days):")
+    for i, seq in enumerate(sequences):
+        print(f"  Sequence {i+1}: {seq['Date'].min()} to {seq['Date'].max()} ({len(seq)} days)")
+   
+    if not sequences:
+        raise ValueError("No normal subperiods longer than 10 days found in the dataset.")
+   
+    return pd.concat(sequences, ignore_index=True)
+
+# Get normal subperiods for training
+normal_subperiod = find_longest_normal_subperiod(data)
+print(f"\nTraining dataset: {len(normal_subperiod)} days from concatenated normal subperiods")
+print(f"All labels are normal: {all(normal_subperiod['Label'] == 'normal')}")
+
+# ============================================================================
+# Block 4: Causal Time Window Feature Engineering
+# ============================================================================
+
+def create_causal_training_windows(normal_data, window_size):
+    """
+    Create training windows from normal data for OCSVM training.
+    Each window contains window_size consecutive Settlement_Diff values.
+    """
+    settlement_diff = normal_data['Settlement_Diff'].values
+    n_samples = len(settlement_diff)
+    
+    if n_samples < window_size:
+        raise ValueError(f"Not enough normal data points ({n_samples}) for window size {window_size}")
+    
+    # Create overlapping windows from normal data
+    windows = []
+    for i in range(n_samples - window_size + 1):
+        window = settlement_diff[i:i + window_size]
+        windows.append(window)
+    
+    return np.array(windows)
+
+# ============================================================================
+# Block 5: Causal Model Training and Scoring
+# ============================================================================
+
+def train_causal_ocsvm(normal_data, window_size, kernel, gamma, nu):
+    """
+    Train One-Class SVM model on normal data windows.
+    """
+    X_train = create_causal_training_windows(normal_data, window_size)
+    model = OneClassSVM(kernel=kernel, gamma=gamma, nu=nu)
+    model.fit(X_train)
+    return model
+
+def causal_anomaly_scoring(model, test_data, window_size):
+    """
+    Score points causally - only using past information and current point.
+    Implements score aggregation for overlapping windows as per algorithm.
+    """
+    scores_dict = defaultdict(list)
+    settlement_diff = test_data['Settlement_Diff'].values
+    dates = test_data['Date'].values
+    n_samples = len(settlement_diff)
+    
+    # For each possible window position
+    for i in range(n_samples - window_size + 1):
+        # Create window ending at position i + window_size - 1
+        window = settlement_diff[i:i + window_size].reshape(1, -1)
+        
+        # Score this window
+        score = model.decision_function(window)[0]
+        
+        # Store score for the LAST point in the window (causal approach)
+        target_date = dates[i + window_size - 1]
+        scores_dict[target_date].append(score)
+    
+    # Aggregate scores - take maximum as specified in algorithm
+    aggregated_scores = {date: max(scores) for date, scores in scores_dict.items()}
+    
+    return aggregated_scores
+
+def detect_anomalies_causal_ocsvm(normal_data, test_data, window_size, kernel, gamma, nu):
+    """
+    Complete causal OCSVM anomaly detection pipeline.
+    """
+    # Train model on normal data
+    model = train_causal_ocsvm(normal_data, window_size, kernel, gamma, nu)
+    
+    # Get causal scores with aggregation
+    scores_dict = causal_anomaly_scoring(model, test_data, window_size)
+    
+    if not scores_dict:
+        return pd.DataFrame(columns=['Date', 'Settlement', 'Settlement_Diff', 'OCSVM_Score', 'Model_Label'])
+    
+    # Apply threshold using nu parameter (percentile-based as in algorithm)
+    scores = list(scores_dict.values())
+    threshold = np.percentile(scores, 100 * nu)
+    
+    # Create results DataFrame
+    results_data = []
+    for date, score in scores_dict.items():
+        # Find corresponding row in test_data
+        row_idx = test_data[test_data['Date'] == date].index[0]
+        
+        results_data.append({
+            'Date': date,
+            'Settlement': test_data.loc[row_idx, 'Settlement'],
+            'Settlement_Diff': test_data.loc[row_idx, 'Settlement_Diff'],
+            'OCSVM_Score': score,
+            'Model_Label': 'anomaly' if score < threshold else 'normal'  # Lower scores = anomalies
+        })
+    
+    results_df = pd.DataFrame(results_data).sort_values('Date').reset_index(drop=True)
+    return results_df
+
+# ============================================================================
+# Block 6: Causal Evaluation Function
+# ============================================================================
+
+def evaluate_causal_model(results_df, test_data):
+    """
+    Evaluate the causal model performance.
+    """
+    if results_df.empty:
+        return {
+            'AUC': 0.0,
+            'Precision': 0.0,
+            'Recall': 0.0,
+            'F1': 0.0,
+            'F_beta': 0.0,
+            'confusion_matrix': np.zeros((2, 2), dtype=int)
+        }
+    
+    # Merge results with ground truth
+    merged = pd.merge(results_df, test_data[['Date', 'Label']], on='Date', how='left')
+    merged['Label'] = merged['Label'].fillna('normal')
+    
+    # Convert to binary
+    y_true = (merged['Label'] == 'anomaly').astype(int)
+    y_pred = (merged['Model_Label'] == 'anomaly').astype(int)
+    y_scores = -merged['OCSVM_Score'].values  # Negative for AUC calculation (lower = more anomalous)
+    
+    # Calculate metrics
+    try:
+        auc = roc_auc_score(y_true, y_scores)
+    except ValueError:
+        auc = 0.0
+    
+    metrics = {
+        'AUC': auc,
+        'Precision': precision_score(y_true, y_pred, zero_division=0),
+        'Recall': recall_score(y_true, y_pred, zero_division=0),
+        'F1': f1_score(y_true, y_pred, zero_division=0),
+        'F_beta': fbeta_score(y_true, y_pred, beta=2, zero_division=0),
+        'confusion_matrix': confusion_matrix(y_true, y_pred),
+        'y_true': y_true,
+        'y_pred': y_pred,
+        'y_scores': y_scores
+    }
+    
+    return metrics, merged
+
+# ============================================================================
+# Block 7: Causal Hyperparameter Tuning
+# ============================================================================
+
+def causal_hyperparameter_tuning(normal_data, full_data):
+    """
+    Perform hyperparameter tuning using causal approach.
+    """
+    print("\n=== CAUSAL HYPERPARAMETER TUNING ===")
+    print("This may take several minutes...")
+    
+    best_score = -1
+    best_params = None
+    all_results = []
+    
+    param_combinations = list(ParameterGrid(param_grid))
+    total_combinations = len(param_combinations)
+    
+    for i, params in enumerate(param_combinations):
+        try:
+            # Print progress
+            if (i + 1) % 50 == 0:
+                print(f"Progress: {i + 1}/{total_combinations} combinations tested")
+            
+            window_size = params['window_size']
+            
+            # Skip if not enough training data
+            if len(normal_data) < window_size:
+                continue
+            
+            # Detect anomalies using causal approach
+            results_df = detect_anomalies_causal_ocsvm(
+                normal_data, full_data, window_size,
+                params['kernel'], params['gamma'], params['nu']
+            )
+            
+            # Evaluate model
+            metrics, merged_df = evaluate_causal_model(results_df, full_data)
+            
+            # Store results
+            result = {**params, **metrics}
+            all_results.append(result)
+            
+            # Update best model based on F_beta score
+            if metrics['F_beta'] > best_score:
+                best_score = metrics['F_beta']
+                best_params = params.copy()
+                
+        except Exception as e:
+            print(f"Error with params {params}: {str(e)}")
+            continue
+    
+    print(f"\nCausal hyperparameter tuning completed!")
+    print(f"Best F_beta score: {best_score:.4f}")
+    print(f"Best parameters: {best_params}")
+    
+    return best_params, all_results
+
+# Perform causal hyperparameter tuning
+best_params, all_results = causal_hyperparameter_tuning(normal_subperiod, data)
+
+# ============================================================================
+# Block 8: Train Final Causal Model
+# ============================================================================
+
+print("\n=== TRAINING FINAL CAUSAL MODEL ===")
+
+# Train and evaluate final model with best parameters
+final_results_df = detect_anomalies_causal_ocsvm(
+    normal_subperiod, data, best_params['window_size'],
+    best_params['kernel'], best_params['gamma'], best_params['nu']
+)
+
+# Evaluate final model
+final_metrics, final_merged = evaluate_causal_model(final_results_df, data)
+
+print(f"Final Causal Model Performance:")
+print(f"  AUC: {final_metrics['AUC']:.4f}")
+print(f"  Precision: {final_metrics['Precision']:.4f}")
+print(f"  Recall: {final_metrics['Recall']:.4f}")
+print(f"  F1 Score: {final_metrics['F1']:.4f}")
+print(f"  F-beta Score: {final_metrics['F_beta']:.4f}")
+
+# Print best parameters and confusion matrix
+print("\n=== BEST CONFIGURATION (based on F2-score) ===")
+print(f"Best parameters: {best_params}")
+print("Confusion Matrix (rows = true, cols = predicted):")
+print(final_metrics['confusion_matrix'])
+
 
