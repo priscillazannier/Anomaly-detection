@@ -1,1 +1,287 @@
+import pandas as pd
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, LSTM, RepeatVector, Dense
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score, roc_curve, roc_auc_score
+import matplotlib.pyplot as plt
+# Setting a random seed ensures that the results of the model training
+# are consistent across different runs.
+SEED = 0
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+# ====================================================================================================
+# Block 1: Load and Preprocess Data
+# ====================================================================================================
+# Load the data from the specified Excel file.
+try:
+    file_path = 'labelled dataset 2023 2024.xlsx'
+    df = pd.read_excel(file_path)
+except FileNotFoundError:
+    print(f"Error: The file '{file_path}' was not found. Please ensure it is in the same directory.")
+    exit()
+df['Date'] = pd.to_datetime(df['Date'])
+# Keep the original 'Label' as strings for the normal subperiod function.
+# Create a numerical label for evaluation: 1 for 'anomaly', 0 for 'normal'.
+df['Label_num'] = (df['Label'] == 'anomaly').astype(int)
+# Compute first-order differences on the 'Settlement' column before further processing.
+# Fill the first NaN with 0 to maintain the original DataFrame length.
+df['Settlement_diff'] = df['Settlement'].diff().fillna(0)
+# ====================================================================================================
+# Block 2: Find All Normal Subperiods (>10 days)
+# ====================================================================================================
+# This function identifies continuous normal periods longer than 10 days.
+# It considers business days and allows for weekends (up to 3 days gap).
+def find_longest_normal_subperiod(df):
+    sequences = []
+    current_length = 0
+    current_start_idx = 0
+    prev_date = None
+    prev_idx = None
+    for idx, row in df.iterrows():
+        is_normal = row['Label'] == 'normal'
+        current_date = row['Date']
+        is_consecutive = prev_date is None or (current_date - prev_date) <= pd.Timedelta(days=3)
+        if is_normal:
+            if is_consecutive:
+                current_length += 1
+            else:
+                if current_length > 10:  # Only keep sequences longer than 10 days
+                    sequences.append(df.iloc[current_start_idx:prev_idx + 1])
+                current_length = 1
+                current_start_idx = idx
+        else:
+            if current_length > 10:
+                sequences.append(df.iloc[current_start_idx:prev_idx + 1])
+            current_length = 0
+            current_start_idx = idx + 1
+        prev_date = current_date
+        prev_idx = idx
+    if current_length > 10:
+        sequences.append(df.iloc[current_start_idx:prev_idx + 1])
+    print("\nAll normal sequences (>10 days) found:")
+    for seq in sequences:
+        print(f"Sequence from {seq['Date'].min()} to {seq['Date'].max()}: {len(seq)} days")
+    if not sequences:
+        raise ValueError("No normal subperiods longer than 10 days found in the dataset.")
+    return sequences
+# Get the list of normal subperiod DataFrames.
+normal_sequences = find_longest_normal_subperiod(df)
+# Concatenate all normal data (now using differences, no scaler fitting needed).
+all_normal_data = pd.concat(normal_sequences, ignore_index=True)
+print(f"\nTraining on concatenated normal subperiods: {all_normal_data['Date'].min()} to "
+      f"{all_normal_data['Date'].max()}, {len(all_normal_data)} days")
+print(f"Contains only normal labels: {all(all_normal_data['Label'] == 'normal')}")
+# Note: Scaler is removed entirely, as we're replacing scaling with differencing.
+# ====================================================================================================
+# Block 3: Define Helper Functions
+# ====================================================================================================
+def create_sequences(data, window_size):
+    """
+    Creates sliding windows from a time series.
+    Args:
+        data (np.array): The time series data (shape: (n_samples, 1)).
+        window_size (int): The number of time steps in each sequence.
+    Returns:
+        np.array: A 3D numpy array of shape (num_samples, window_size, 1).
+    """
+    sequences = []
+    for i in range(len(data) - window_size + 1):
+        sequences.append(data[i:i + window_size])
+    return np.array(sequences)
+def evaluate_anomalies(anomaly_scores, true_labels, contamination):
+    """
+    Evaluates the performance of the anomaly detection model against ground truth labels.
+    Args:
+        anomaly_scores (np.array): The reconstruction errors for each data point.
+        true_labels (np.array): The ground truth labels (0=normal, 1=anomaly).
+        contamination (float): The expected proportion of anomalies in the dataset.
+    Returns:
+        tuple: A dictionary of metrics and the predicted labels.
+    """
+    # Determine the anomaly threshold based on the specified contamination rate.
+    threshold = np.quantile(anomaly_scores, 1 - contamination)
+    y_pred = (anomaly_scores > threshold).astype(int)
+    
+    # Calculate performance metrics
+    cm = confusion_matrix(true_labels, y_pred)
+    precision = precision_score(true_labels, y_pred, zero_division=0)
+    recall = recall_score(true_labels, y_pred, zero_division=0)
+    f1 = f1_score(true_labels, y_pred, zero_division=0)
+    
+    # F-beta score with beta=2 (gives more weight to recall)
+    beta = 2
+    f_beta_2 = (1 + beta**2) * (precision * recall) / (beta**2 * precision + recall) if (beta**2 * precision + recall) > 0 else 0
+    
+    try:
+        auc = roc_auc_score(true_labels, anomaly_scores)
+    except ValueError:
+        auc = 0.0
+    
+    metrics = {
+        'Confusion_Matrix': cm,
+        'Precision': precision,
+        'Recall': recall,
+        'F1': f1,
+        'F_beta_2': f_beta_2,
+        'AUC': auc,
+        'Threshold': threshold
+    }
+    return metrics, y_pred
+# ====================================================================================================
+# Block 4: Hyperparameter Tuning and Model Training
+# ====================================================================================================
+# List of window sizes to test
+WINDOW_SIZES = range(5, 26) # range(5, 26)
+EPOCHS = 50
+BATCH_SIZE = 32
+LATENT_DIM = 5  # Size of the compressed representation in the autoencoder
+results = {}
+best_f_beta_2 = -1
+best_window_size = -1
+# Loop through each window size to find the best configuration - only on normal data
+for window_size in WINDOW_SIZES:
+    print(f"====================================================================================================")
+    print(f"Training for WINDOW_SIZE = {window_size}")
+    print(f"====================================================================================================")
+    
+    # Create training sequences from each normal subperiod separately to avoid crossing discontinuities.
+    train_seqs = []
+    for seq in normal_sequences:
+        # Use the precomputed differences (no scaling).
+        seq_data = seq[['Settlement_diff']].values.reshape(-1, 1)
+       
+        # Create sequences only if the subperiod is long enough for the window.
+        if len(seq_data) >= window_size:
+            sub_X = create_sequences(seq_data, window_size)
+            train_seqs.append(sub_X)
+    
+    # Concatenate all training sequences from normal subperiods.
+    if train_seqs:
+        X_train_normal = np.concatenate(train_seqs)
+    else:
+        print(f"No sufficient normal data for window_size={window_size}. Skipping.")
+        continue
+    
+    # Build the LSTM Autoencoder model.
+    inputs = Input(shape=(window_size, 1))
+    encoded = LSTM(40, activation='relu', return_sequences=False)(inputs)
+    encoded = Dense(LATENT_DIM, activation='relu')(encoded)
+    repeated = RepeatVector(window_size)(encoded)
+    decoded = LSTM(40, activation='relu', return_sequences=True)(repeated)
+    decoded = Dense(1)(decoded)
+    autoencoder = Model(inputs, decoded)
+    autoencoder.compile(optimizer='adam', loss='mean_squared_error')
+    
+    # Train the model on the normal sequences.
+    history = autoencoder.fit(X_train_normal, X_train_normal, epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=0, shuffle=False, validation_split=0.2)
+    
+    # Prepare the full dataset for inference using differences.
+    full_data = df[['Settlement_diff']].values.reshape(-1, 1)
+    X_full = create_sequences(full_data, window_size)
+    
+    # The labels now cover the full dataset (no shift, since scores will be point-wise)
+    y_labels = df['Label_num'].values
+    
+    # Get the reconstruction errors for the full data.
+    X_pred = autoencoder.predict(X_full, verbose=0)
+    
+    # CALCULATE PER-TIMESTEP ABSOLUTE ERRORS AND AVERAGE OVER OVERLAPPING WINDOWS
+    reconstruction_errors = np.abs(X_full - X_pred)  # Shape: (num_windows, window_size, 1)
+    full_errors = np.zeros(len(full_data))
+    counts = np.zeros(len(full_data))
+    for i in range(len(reconstruction_errors)):
+        start_idx = i
+        end_idx = i + window_size
+        full_errors[start_idx:end_idx] += reconstruction_errors[i, :, 0]
+        counts[start_idx:end_idx] += 1
+    anomaly_scores = full_errors / np.maximum(counts, 1)  # Average absolute error per point
+    
+    # Evaluate the model using the labels (for tuning purposes).
+    actual_contamination = df['Label_num'].sum() / len(df)  # on the entire dataset
+    metrics, y_pred_labels = evaluate_anomalies(anomaly_scores, y_labels, actual_contamination)
+    results[window_size] = metrics
+    
+    # Check if this is the best F-beta_2 score so far.
+    if metrics['F_beta_2'] > best_f_beta_2:
+        best_f_beta_2 = metrics['F_beta_2']
+        best_window_size = window_size
+        best_model = autoencoder
+        best_history = history
+        best_anomaly_scores = anomaly_scores
+        best_y_labels = y_labels
+        best_y_pred_labels = y_pred_labels
+        best_final_merged_data = pd.DataFrame({
+            'Date': df['Date'].values,
+            'Settlement_Value': df['Settlement'].values,  # Still plot original values
+            'Label': best_y_labels,
+            'Model_Label': best_y_pred_labels,
+            'Anomaly_Score': best_anomaly_scores
+        })
+print("====================================================================================================")
+print(f"Best WINDOW_SIZE is {best_window_size} with F_beta_2 Score: {best_f_beta_2:.4f}")
+print("====================================================================================================")
+print("\n")
+# ====================================================================================================
+# Block 5: Evaluation and Visualization for Best Model
+# ====================================================================================================
+# Display final metrics for the best model
+print("====================================================================================================")
+print(f"Final Performance Metrics for the BEST model (WINDOW_SIZE={best_window_size}):")
+print("====================================================================================================")
+for metric_name, metric_value in results[best_window_size].items():
+    if metric_name not in ['Confusion_Matrix', 'Threshold']:
+        print(f"{metric_name}: {metric_value:.4f}")
+print("\n")
+print("====================================================================================================")
+print(f"Confusion Matrix (Best Model, WINDOW_SIZE={best_window_size}):")
+print("====================================================================================================")
+confusion_matrix_df = pd.DataFrame(
+    results[best_window_size]['Confusion_Matrix'],
+    index=['Actual Normal', 'Actual Anomaly'],
+    columns=['Predicted Normal', 'Predicted Anomaly']
+)
+print(confusion_matrix_df)
+print("\n")
+# Plot Training Loss for Best Model
+plt.figure(figsize=(10, 6))
+plt.plot(best_history.history['loss'], label='Training Loss')
+plt.plot(best_history.history['val_loss'], label='Validation Loss')
+plt.title(f'Model Training and Validation Loss (Best Model, WINDOW_SIZE={best_window_size})')
+plt.ylabel('Loss (Mean Squared Error)')
+plt.xlabel('Epoch')
+plt.legend()
+plt.grid(True)
+plt.show()
+# Plot ROC Curve for Best Model
+fpr, tpr, thresholds = roc_curve(best_y_labels, best_anomaly_scores)
+plt.figure(figsize=(8, 6))
+plt.plot(fpr, tpr, label=f'AUC = {results[best_window_size]["AUC"]:.2f}')
+plt.plot([0, 1], [0, 1], 'k--', label='Random Classifier')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title(f'ROC Curve (Best Model, WINDOW_SIZE={best_window_size})')
+plt.legend()
+plt.grid(True)
+plt.show()
+# Plot Settlement Values with Anomaly Labels for Best Model
+# Note: We still plot the original 'Settlement_Value' for visualization, even though the model uses differences.
+plt.figure(figsize=(14, 7))
+plt.plot(best_final_merged_data['Date'], best_final_merged_data['Settlement_Value'], label='Settlement Value', color='blue', linewidth=1)
+# Plot the different types of anomaly detections as scatter points
+plot_true_positives = best_final_merged_data[(best_final_merged_data['Label'] == 1) & (best_final_merged_data['Model_Label'] == 1)]
+plot_false_negatives = best_final_merged_data[(best_final_merged_data['Label'] == 1) & (best_final_merged_data['Model_Label'] == 0)]
+plot_false_positives = best_final_merged_data[(best_final_merged_data['Label'] == 0) & (best_final_merged_data['Model_Label'] == 1)]
+plt.scatter(plot_true_positives['Date'], plot_true_positives['Settlement_Value'], color='green', edgecolor='black', s=70, zorder=5, alpha=0.7, label='True Positive (Correct Anomaly)')
+plt.scatter(plot_false_negatives['Date'], plot_false_negatives['Settlement_Value'], color='red', edgecolor='black', s=70, zorder=5, alpha=0.7, label='False Negative (Missed Anomaly)')
+plt.scatter(plot_false_positives['Date'], plot_false_positives['Settlement_Value'], color='yellow', edgecolor='black', s=70, zorder=5, alpha=0.7, label='False Positive (Detected Anomaly)')
+plt.legend()
+plt.title(f'Settlement Values with Anomaly Labels (Best Model, WINDOW_SIZE={best_window_size})')
+plt.xlabel('Date')
+plt.ylabel('Settlement Value')
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
 
